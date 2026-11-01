@@ -177,19 +177,23 @@ def load_dataset() -> tuple[np.ndarray, np.ndarray, str]:
     return load_canonical_cifar10()
 
 
-def build_cnn() -> Any:
+def build_cnn(include_augmentation: bool = True) -> Any:
     """Create a compact CNN for 32x32 RGB images and 10 classes."""
     import tensorflow as tf
 
-    augmentation = tf.keras.Sequential(
-        [
-            tf.keras.layers.RandomFlip("horizontal"),
-            tf.keras.layers.RandomTranslation(0.08, 0.08),
-        ],
-        name="data_augmentation",
-    )
     inputs = tf.keras.Input(shape=(32, 32, 3), name="image")
-    x = augmentation(inputs)
+    if include_augmentation:
+        augmentation = tf.keras.Sequential(
+            [
+                tf.keras.layers.RandomFlip("horizontal"),
+                tf.keras.layers.RandomTranslation(0.08, 0.08),
+            ],
+            name="data_augmentation",
+        )
+        x = augmentation(inputs)
+    else:
+        x = inputs
+
     x = tf.keras.layers.Rescaling(1.0 / 255)(x)
 
     for filters, dropout_rate in ((32, 0.15), (64, 0.20)):
@@ -211,7 +215,11 @@ def build_cnn() -> Any:
     return model
 
 
-def train_model(epochs: int = DEFAULT_EPOCHS, verbose: int = 2) -> tuple[Any, dict[str, Any]]:
+def train_model(
+    epochs: int = DEFAULT_EPOCHS,
+    max_train_per_class: int = MAX_TRAIN_PER_CLASS,
+    verbose: int = 2,
+) -> tuple[Any, dict[str, Any]]:
     """Train the CNN and evaluate it on a stratified held-out test split."""
     import tensorflow as tf
 
@@ -226,14 +234,14 @@ def train_model(epochs: int = DEFAULT_EPOCHS, verbose: int = 2) -> tuple[Any, di
     for class_id in range(len(CLASS_NAMES)):
         class_train_ids = training_pool_ids[labels[training_pool_ids] == class_id].copy()
         rng.shuffle(class_train_ids)
-        selected_train_parts.append(class_train_ids[:MAX_TRAIN_PER_CLASS])
+        selected_train_parts.append(class_train_ids[:max_train_per_class])
     train_ids = np.concatenate(selected_train_parts)
     rng.shuffle(train_ids)
     x_train, y_train = images[train_ids], labels[train_ids]
     x_validation, y_validation = images[validation_ids], labels[validation_ids]
     x_test, y_test = images[test_ids], labels[test_ids]
 
-    model = build_cnn()
+    model = build_cnn(include_augmentation=True)
     history = model.fit(
         x_train,
         y_train,
@@ -293,7 +301,7 @@ def train_model(epochs: int = DEFAULT_EPOCHS, verbose: int = 2) -> tuple[Any, di
 
 
 def save_training_outputs(model: Any, metrics: dict[str, Any], output_dir: Path) -> None:
-    """Save temporary model and figures used to prepare the project report."""
+    """Save model, cross-platform weights, and figures used to prepare the project report."""
     import matplotlib
 
     matplotlib.use("Agg")
@@ -301,6 +309,27 @@ def save_training_outputs(model: Any, metrics: dict[str, Any], output_dir: Path)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     model.save(output_dir / "cifar10_cnn.keras")
+
+    # Export cross-platform NumPy weights (.npz)
+    try:
+        np.savez(
+            output_dir / "cifar10_weights.npz",
+            c0_w=model.get_layer("conv2d").get_weights()[0],
+            c0_b=model.get_layer("conv2d").get_weights()[1],
+            c1_w=model.get_layer("conv2d_1").get_weights()[0],
+            c1_b=model.get_layer("conv2d_1").get_weights()[1],
+            c2_w=model.get_layer("conv2d_2").get_weights()[0],
+            c2_b=model.get_layer("conv2d_2").get_weights()[1],
+            c3_w=model.get_layer("conv2d_3").get_weights()[0],
+            c3_b=model.get_layer("conv2d_3").get_weights()[1],
+            d0_w=model.get_layer("dense").get_weights()[0],
+            d0_b=model.get_layer("dense").get_weights()[1],
+            d1_w=model.get_layer("class_probabilities").get_weights()[0],
+            d1_b=model.get_layer("class_probabilities").get_weights()[1],
+        )
+    except Exception as exc:
+        print(f"Warning: Could not export .npz weights: {exc}")
+
     compact_metrics = {
         key: value
         for key, value in metrics.items()
@@ -360,58 +389,92 @@ def save_training_outputs(model: Any, metrics: dict[str, Any], output_dir: Path)
     plt.close(figure)
 
 
+def predict_numpy_single(img_32x32: np.ndarray, w: Any) -> np.ndarray:
+    """Pure NumPy forward pass for 32x32 CIFAR-10 classification."""
+    def relu(x: np.ndarray) -> np.ndarray:
+        return np.maximum(x, 0.0)
+
+    def conv2d_same(x: np.ndarray, kernel: np.ndarray, bias: np.ndarray) -> np.ndarray:
+        H, W, C = x.shape
+        kH, kW, _, C_out = kernel.shape
+        pad_h, pad_w = kH // 2, kW // 2
+        padded = np.pad(x, ((pad_h, pad_h), (pad_w, pad_w), (0, 0)), mode="constant")
+        out = np.zeros((H, W, C_out), dtype=np.float32)
+        for i in range(H):
+            for j in range(W):
+                patch = padded[i : i + kH, j : j + kW, :]
+                out[i, j] = np.tensordot(patch, kernel, axes=([0, 1, 2], [0, 1, 2])) + bias
+        return out
+
+    def max_pool_2x2(x: np.ndarray) -> np.ndarray:
+        H, W, C = x.shape
+        return x.reshape(H // 2, 2, W // 2, 2, C).max(axis=(1, 3))
+
+    x = img_32x32.astype(np.float32) / 255.0
+    x = relu(conv2d_same(x, w["c0_w"], w["c0_b"]))
+    x = relu(conv2d_same(x, w["c1_w"], w["c1_b"]))
+    x = max_pool_2x2(x)
+    x = relu(conv2d_same(x, w["c2_w"], w["c2_b"]))
+    x = relu(conv2d_same(x, w["c3_w"], w["c3_b"]))
+    x = max_pool_2x2(x)
+    x = x.mean(axis=(0, 1))  # GlobalAveragePooling2D
+    x = relu(np.dot(x, w["d0_w"]) + w["d0_b"])
+    logits = np.dot(x, w["d1_w"]) + w["d1_b"]
+    exp = np.exp(logits - np.max(logits))
+    return exp / np.sum(exp)
+
+
+class NumpyCNNPredictor:
+    """Keras-compatible predictor operating purely in NumPy."""
+    def __init__(self, weights: Any):
+        self.w = weights
+
+    def predict(self, x: np.ndarray, verbose: int = 0) -> np.ndarray:
+        preds = []
+        for img in x:
+            preds.append(predict_numpy_single(img, self.w))
+        return np.asarray(preds, dtype=np.float32)
+
+
 def load_cifar10_model() -> tuple[Any, str, dict[str, Any] | None]:
     """Load pre-trained model for low-latency web inference without retraining."""
-    import tensorflow as tf
-
     repo_dir = Path(__file__).resolve().parent
+    npz_path = repo_dir / "cifar10_weights.npz"
     bundled_model_path = repo_dir / "cifar10_cnn.keras"
-    bundled_weights_path = repo_dir / "cifar10_cnn.weights.h5"
-    cache_model_path = runtime_directory() / "cifar10_cnn.keras"
 
-    errors: list[str] = []
+    # Attempt 1: Load portable NumPy weights into Keras model
+    if npz_path.is_file():
+        try:
+            w = np.load(npz_path)
+            model = build_cnn(include_augmentation=False)
+            model.get_layer("conv2d").set_weights([w["c0_w"], w["c0_b"]])
+            model.get_layer("conv2d_1").set_weights([w["c1_w"], w["c1_b"]])
+            model.get_layer("conv2d_2").set_weights([w["c2_w"], w["c2_b"]])
+            model.get_layer("conv2d_3").set_weights([w["c3_w"], w["c3_b"]])
+            model.get_layer("dense").set_weights([w["d0_w"], w["d0_b"]])
+            model.get_layer("class_probabilities").set_weights([w["d1_w"], w["d1_b"]])
+            return model, "npz_keras", None
+        except Exception:
+            pass
 
-    # Attempt 1: load_model with compile=False and safe_mode=False (handles custom & augmentation layers)
-    for candidate in (bundled_model_path, cache_model_path):
-        if candidate.is_file():
-            try:
-                model = tf.keras.models.load_model(candidate, compile=False, safe_mode=False)
-                return model, "bundle" if candidate == bundled_model_path else "cache", None
-            except Exception as exc:
-                errors.append(f"load_model(safe_mode=False) on {candidate.name}: {type(exc).__name__}: {exc}")
+    # Attempt 2: Zero-dependency pure NumPy predictor fallback
+    if npz_path.is_file():
+        try:
+            w = np.load(npz_path)
+            return NumpyCNNPredictor(w), "pure_numpy", None
+        except Exception:
+            pass
 
-    # Attempt 2: tf.keras.saving.load_model (Keras 3 / TF 2.15+ saving subsystem)
-    if hasattr(tf.keras, "saving") and hasattr(tf.keras.saving, "load_model"):
-        for candidate in (bundled_model_path, cache_model_path):
-            if candidate.is_file():
-                try:
-                    model = tf.keras.saving.load_model(candidate, compile=False, safe_mode=False)
-                    return model, "bundle" if candidate == bundled_model_path else "cache", None
-                except Exception as exc:
-                    errors.append(f"keras.saving.load_model on {candidate.name}: {type(exc).__name__}: {exc}")
-
-    # Attempt 3: Reconstruct exact CNN architecture and load weights by name
-    for candidate in (bundled_weights_path, bundled_model_path, cache_model_path):
-        if candidate.is_file():
-            try:
-                model = build_cnn()
-                model.load_weights(candidate, by_name=True, skip_mismatch=True)
-                return model, "weights", None
-            except Exception as exc:
-                errors.append(f"build_cnn+load_weights(by_name=True) on {candidate.name}: {type(exc).__name__}: {exc}")
-
-    # Attempt 4: Standard load_model fallback
+    # Attempt 3: Standard Keras load_model fallback
     if bundled_model_path.is_file():
         try:
-            model = tf.keras.models.load_model(bundled_model_path)
+            import tensorflow as tf
+            model = tf.keras.models.load_model(bundled_model_path, compile=False, safe_mode=False)
             return model, "bundle", None
-        except Exception as exc:
-            errors.append(f"load_model(standard) on {bundled_model_path.name}: {type(exc).__name__}: {exc}")
+        except Exception:
+            pass
 
-    raise RuntimeError(
-        "Could not load pre-trained weights from repository.\n"
-        + "\n".join(f"• {err}" for err in errors)
-    )
+    raise RuntimeError("Could not find pre-trained weights in 'cifar10_weights.npz' or 'cifar10_cnn.keras'.")
 
 
 def streamlit_app() -> None:
@@ -451,9 +514,9 @@ def streamlit_app() -> None:
     model, source_type, info = _get_cached_model()
     if source_type == "error":
         st.error(f"❌ Failed to load model: {info.get('error', 'Unknown error') if info else 'Unknown error'}")
-        st.info("Ensure pre-trained model weights (cifar10_cnn.keras or cifar10_cnn.weights.h5) are present in the repo.")
+        st.info("Ensure pre-trained model weights are present in the repo.")
         return
-    elif source_type in ("bundle", "weights"):
+    elif source_type in ("bundle", "weights", "npz_keras", "pure_numpy"):
         st.caption("✅ Pre-trained CNN weights loaded successfully.")
     else:
         st.caption("⚡ Model loaded from runtime cache.")
@@ -469,14 +532,16 @@ def streamlit_app() -> None:
         sample_map = {f.stem.replace("_sample", "").title(): f for f in sample_files}
         source_mode = st.radio(
             "Select input method:",
-            ["Choose from sample images", "Upload your own image"],
+            ["Choose from sample images (all 10 classes)", "Upload your own image"],
             horizontal=True,
         )
 
-        if source_mode == "Choose from sample images":
+        if source_mode.startswith("Choose from sample"):
+            ordered_choices = [c.title() for c in CLASS_NAMES if c.title() in sample_map]
             sample_choice = st.selectbox(
-                "Pick a sample image to test:",
-                list(sample_map.keys()),
+                "Pick a sample image to test (all 10 CIFAR-10 classes):",
+                ordered_choices,
+                index=ordered_choices.index("Cat") if "Cat" in ordered_choices else 0,
             )
             if sample_choice:
                 sample_path = sample_map[sample_choice]
@@ -556,6 +621,12 @@ def main() -> None:
     parser.add_argument("--train", action="store_true", help="train a model and save report plots")
     parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS, help=f"maximum epochs (default: {DEFAULT_EPOCHS})")
     parser.add_argument(
+        "--max-train-per-class",
+        type=int,
+        default=MAX_TRAIN_PER_CLASS,
+        help=f"training samples per class (default: {MAX_TRAIN_PER_CLASS}, max: 5000 for full CIFAR-10)",
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         default=runtime_directory(),
@@ -565,7 +636,7 @@ def main() -> None:
     if args.train:
         if args.epochs < 1:
             parser.error("--epochs must be at least 1")
-        model, metrics = train_model(epochs=args.epochs)
+        model, metrics = train_model(epochs=args.epochs, max_train_per_class=args.max_train_per_class)
         save_training_outputs(model, metrics, args.output_dir)
         omitted = {
             "history",
