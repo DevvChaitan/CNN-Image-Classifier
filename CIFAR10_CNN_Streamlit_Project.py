@@ -369,37 +369,48 @@ def load_cifar10_model() -> tuple[Any, str, dict[str, Any] | None]:
     bundled_weights_path = repo_dir / "cifar10_cnn.weights.h5"
     cache_model_path = runtime_directory() / "cifar10_cnn.keras"
 
-    # Attempt 1: Direct load_model with compile=False (fastest, prevents optimizer conflicts)
+    errors: list[str] = []
+
+    # Attempt 1: load_model with compile=False and safe_mode=False (handles custom & augmentation layers)
     for candidate in (bundled_model_path, cache_model_path):
         if candidate.is_file():
             try:
-                model = tf.keras.models.load_model(candidate, compile=False)
+                model = tf.keras.models.load_model(candidate, compile=False, safe_mode=False)
                 return model, "bundle" if candidate == bundled_model_path else "cache", None
-            except Exception:
-                pass
+            except Exception as exc:
+                errors.append(f"load_model(safe_mode=False) on {candidate.name}: {type(exc).__name__}: {exc}")
 
-    # Attempt 2: Reconstruct exact CNN architecture and load weights
+    # Attempt 2: tf.keras.saving.load_model (Keras 3 / TF 2.15+ saving subsystem)
+    if hasattr(tf.keras, "saving") and hasattr(tf.keras.saving, "load_model"):
+        for candidate in (bundled_model_path, cache_model_path):
+            if candidate.is_file():
+                try:
+                    model = tf.keras.saving.load_model(candidate, compile=False, safe_mode=False)
+                    return model, "bundle" if candidate == bundled_model_path else "cache", None
+                except Exception as exc:
+                    errors.append(f"keras.saving.load_model on {candidate.name}: {type(exc).__name__}: {exc}")
+
+    # Attempt 3: Reconstruct exact CNN architecture and load weights by name
     for candidate in (bundled_weights_path, bundled_model_path, cache_model_path):
         if candidate.is_file():
             try:
                 model = build_cnn()
-                model.load_weights(candidate)
+                model.load_weights(candidate, by_name=True, skip_mismatch=True)
                 return model, "weights", None
-            except Exception:
-                pass
+            except Exception as exc:
+                errors.append(f"build_cnn+load_weights(by_name=True) on {candidate.name}: {type(exc).__name__}: {exc}")
 
-    # Attempt 3: Standard load_model
+    # Attempt 4: Standard load_model fallback
     if bundled_model_path.is_file():
         try:
             model = tf.keras.models.load_model(bundled_model_path)
             return model, "bundle", None
-        except Exception:
-            pass
+        except Exception as exc:
+            errors.append(f"load_model(standard) on {bundled_model_path.name}: {type(exc).__name__}: {exc}")
 
-    # Do NOT trigger automatic CPU training on Streamlit Cloud
-    raise FileNotFoundError(
-        "Pre-trained model files ('cifar10_cnn.keras' or 'cifar10_cnn.weights.h5') could not be loaded. "
-        "Please check repository weights or run training locally via: python CIFAR10_CNN_Streamlit_Project.py --train"
+    raise RuntimeError(
+        "Could not load pre-trained weights from repository.\n"
+        + "\n".join(f"• {err}" for err in errors)
     )
 
 
