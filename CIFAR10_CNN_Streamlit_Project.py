@@ -9,10 +9,10 @@ Run the app with:
 For a fresh model and report plots, run:
     python CIFAR10_CNN_Streamlit_Project.py --train --epochs 8
 
-If train.7z and trainLabels.csv are next to this repository, they are used.
-Otherwise the script downloads the canonical CIFAR-10 dataset through Keras.
-The app writes its generated model and training output to the system temp folder;
-those artifacts are not part of the submission.
+The repository includes a small trained model so the public app starts without
+training. For a fresh training run, train.7z and trainLabels.csv are used when
+they are next to the repository; otherwise Keras downloads canonical CIFAR-10.
+Generated training outputs are written to the system temp folder.
 """
 
 from __future__ import annotations
@@ -381,14 +381,21 @@ def streamlit_app() -> None:
         st.caption("The displayed scores are model confidence values and may not be calibrated probabilities.")
 
     model_path = runtime_directory() / "cifar10_cnn.keras"
-    if model_path.is_file():
+    bundled_model_path = Path(__file__).resolve().with_name("cifar10_cnn.keras")
+    model = None
+    loaded_from_bundle = False
+    for candidate in (model_path, bundled_model_path):
+        if not candidate.is_file():
+            continue
         try:
-            model = tf.keras.models.load_model(model_path)
+            model = tf.keras.models.load_model(candidate)
+            loaded_from_bundle = candidate == bundled_model_path
+            if loaded_from_bundle:
+                model.save(model_path)
+            break
         except Exception:
-            model_path.unlink(missing_ok=True)
-            model = None
-    else:
-        model = None
+            if candidate == model_path:
+                candidate.unlink(missing_ok=True)
 
     if model is None:
         with st.spinner("Preparing CIFAR-10 data and training the CNN for its first run…"):
@@ -398,6 +405,8 @@ def streamlit_app() -> None:
             f"Model ready. The first run trained for {metrics['epochs_completed']} epoch(s); "
             f"held-out accuracy was {metrics['test_accuracy']:.1%}. The model is cached for this environment."
         )
+    elif loaded_from_bundle:
+        st.caption("Pre-trained model loaded from the project repository.")
     else:
         st.caption("Model loaded from the local runtime cache.")
 
