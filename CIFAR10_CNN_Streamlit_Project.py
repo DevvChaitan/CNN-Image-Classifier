@@ -361,29 +361,46 @@ def save_training_outputs(model: Any, metrics: dict[str, Any], output_dir: Path)
 
 
 def load_cifar10_model() -> tuple[Any, str, dict[str, Any] | None]:
-    """Load the pre-trained model or train on-demand if no model is found."""
+    """Load pre-trained model for low-latency web inference without retraining."""
     import tensorflow as tf
 
-    model_path = runtime_directory() / "cifar10_cnn.keras"
-    bundled_model_path = Path(__file__).resolve().with_name("cifar10_cnn.keras")
-    for candidate in (bundled_model_path, model_path):
-        if not candidate.is_file():
-            continue
-        try:
-            model = tf.keras.models.load_model(candidate)
-            source = "bundle" if candidate == bundled_model_path else "cache"
-            return model, source, None
-        except Exception:
-            if candidate == model_path:
-                candidate.unlink(missing_ok=True)
+    repo_dir = Path(__file__).resolve().parent
+    bundled_model_path = repo_dir / "cifar10_cnn.keras"
+    bundled_weights_path = repo_dir / "cifar10_cnn.weights.h5"
+    cache_model_path = runtime_directory() / "cifar10_cnn.keras"
 
-    # Train model if neither bundled nor cached model is available
-    model, metrics = train_model(epochs=DEFAULT_EPOCHS, verbose=0)
-    try:
-        model.save(model_path)
-    except Exception:
-        pass
-    return model, "trained", metrics
+    # Attempt 1: Direct load_model with compile=False (fastest, prevents optimizer conflicts)
+    for candidate in (bundled_model_path, cache_model_path):
+        if candidate.is_file():
+            try:
+                model = tf.keras.models.load_model(candidate, compile=False)
+                return model, "bundle" if candidate == bundled_model_path else "cache", None
+            except Exception:
+                pass
+
+    # Attempt 2: Reconstruct exact CNN architecture and load weights
+    for candidate in (bundled_weights_path, bundled_model_path, cache_model_path):
+        if candidate.is_file():
+            try:
+                model = build_cnn()
+                model.load_weights(candidate)
+                return model, "weights", None
+            except Exception:
+                pass
+
+    # Attempt 3: Standard load_model
+    if bundled_model_path.is_file():
+        try:
+            model = tf.keras.models.load_model(bundled_model_path)
+            return model, "bundle", None
+        except Exception:
+            pass
+
+    # Do NOT trigger automatic CPU training on Streamlit Cloud
+    raise FileNotFoundError(
+        "Pre-trained model files ('cifar10_cnn.keras' or 'cifar10_cnn.weights.h5') could not be loaded. "
+        "Please check repository weights or run training locally via: python CIFAR10_CNN_Streamlit_Project.py --train"
+    )
 
 
 def streamlit_app() -> None:
@@ -415,18 +432,20 @@ def streamlit_app() -> None:
     # Cache model resource in memory across Streamlit reruns
     @st.cache_resource(show_spinner="Loading pre-trained CNN model…")
     def _get_cached_model():
-        return load_cifar10_model()
+        try:
+            return load_cifar10_model()
+        except Exception as exc:
+            return None, "error", {"error": str(exc)}
 
-    model, source_type, metrics = _get_cached_model()
-    if source_type == "trained" and metrics:
-        st.success(
-            f"Model ready. Trained for {metrics['epochs_completed']} epoch(s); "
-            f"held-out accuracy was {metrics['test_accuracy']:.1%}."
-        )
-    elif source_type == "bundle":
-        st.caption("✅ Pre-trained model loaded from the project repository.")
+    model, source_type, info = _get_cached_model()
+    if source_type == "error":
+        st.error(f"❌ Failed to load model: {info.get('error', 'Unknown error') if info else 'Unknown error'}")
+        st.info("Ensure pre-trained model weights (cifar10_cnn.keras or cifar10_cnn.weights.h5) are present in the repo.")
+        return
+    elif source_type in ("bundle", "weights"):
+        st.caption("✅ Pre-trained CNN weights loaded successfully.")
     else:
-        st.caption("⚡ Model loaded from the local runtime cache.")
+        st.caption("⚡ Model loaded from runtime cache.")
 
     # Sample images option for zero-friction testing
     sample_dir = Path(__file__).resolve().parent / "sample_images"
