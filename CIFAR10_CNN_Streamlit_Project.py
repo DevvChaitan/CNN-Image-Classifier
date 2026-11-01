@@ -360,93 +360,164 @@ def save_training_outputs(model: Any, metrics: dict[str, Any], output_dir: Path)
     plt.close(figure)
 
 
-def streamlit_app() -> None:
-    """Render the image upload and classification experience."""
-    import streamlit as st
-    from PIL import Image, UnidentifiedImageError
+def load_cifar10_model() -> tuple[Any, str, dict[str, Any] | None]:
+    """Load the pre-trained model or train on-demand if no model is found."""
     import tensorflow as tf
-
-    st.set_page_config(page_title="CIFAR-10 Image Classifier", page_icon="🧠", layout="centered")
-    st.title("CIFAR-10 Image Classifier")
-    st.write(
-        "Upload a small photo and the CNN will estimate which CIFAR-10 category it most resembles. "
-        "The model recognizes airplanes, automobiles, birds, cats, deer, dogs, frogs, horses, ships, and trucks."
-    )
-    with st.expander("How it works"):
-        st.markdown(
-            "1. The image is converted to RGB and resized to 32 × 32 pixels.\n"
-            "2. A convolutional neural network scores the 10 CIFAR-10 classes.\n"
-            "3. The highest model score is shown with the other class scores."
-        )
-        st.caption("The displayed scores are model confidence values and may not be calibrated probabilities.")
 
     model_path = runtime_directory() / "cifar10_cnn.keras"
     bundled_model_path = Path(__file__).resolve().with_name("cifar10_cnn.keras")
-    model = None
-    loaded_from_bundle = False
-    for candidate in (model_path, bundled_model_path):
+    for candidate in (bundled_model_path, model_path):
         if not candidate.is_file():
             continue
         try:
             model = tf.keras.models.load_model(candidate)
-            loaded_from_bundle = candidate == bundled_model_path
-            if loaded_from_bundle:
-                model.save(model_path)
-            break
+            source = "bundle" if candidate == bundled_model_path else "cache"
+            return model, source, None
         except Exception:
             if candidate == model_path:
                 candidate.unlink(missing_ok=True)
 
-    if model is None:
-        with st.spinner("Preparing CIFAR-10 data and training the CNN for its first run…"):
-            model, metrics = train_model(epochs=DEFAULT_EPOCHS, verbose=0)
-            model.save(model_path)
-        st.success(
-            f"Model ready. The first run trained for {metrics['epochs_completed']} epoch(s); "
-            f"held-out accuracy was {metrics['test_accuracy']:.1%}. The model is cached for this environment."
-        )
-    elif loaded_from_bundle:
-        st.caption("Pre-trained model loaded from the project repository.")
-    else:
-        st.caption("Model loaded from the local runtime cache.")
-
-    uploaded_file = st.file_uploader(
-        "Choose an image", type=["png", "jpg", "jpeg", "webp"], help="PNG, JPG, JPEG, or WebP image"
-    )
-    if uploaded_file is None:
-        st.info("Upload an image to see the predicted class.")
-        return
-
+    # Train model if neither bundled nor cached model is available
+    model, metrics = train_model(epochs=DEFAULT_EPOCHS, verbose=0)
     try:
-        with Image.open(uploaded_file) as source_image:
-            image = source_image.convert("RGB")
-    except (UnidentifiedImageError, OSError, ValueError):
-        st.error("That file could not be read as an image. Upload a valid PNG, JPG, JPEG, or WebP file.")
+        model.save(model_path)
+    except Exception:
+        pass
+    return model, "trained", metrics
+
+
+def streamlit_app() -> None:
+    """Render the image upload and classification experience."""
+    import streamlit as st
+    from PIL import Image, UnidentifiedImageError
+
+    st.set_page_config(
+        page_title="CIFAR-10 Image Classifier",
+        page_icon="🧠",
+        layout="centered",
+        initial_sidebar_state="collapsed",
+    )
+    st.title("🧠 CIFAR-10 Image Classifier")
+    st.write(
+        "Upload a small photo or choose a sample image below to see real-time CNN predictions. "
+        "The model classifies across 10 CIFAR-10 categories: **airplane**, **automobile**, **bird**, "
+        "**cat**, **deer**, **dog**, **frog**, **horse**, **ship**, and **truck**."
+    )
+    with st.expander("ℹ️ How it works & Model Architecture"):
+        st.markdown(
+            "1. **Input Preprocessing**: The image is converted to RGB and resized to 32 × 32 pixels.\n"
+            "2. **Convolutional Neural Network**: 2 convolutional blocks (32 & 64 filters) with max pooling and dropout.\n"
+            "3. **Dense Classification**: Global average pooling feeding into a 96-unit dense layer with softmax activation.\n"
+            "4. **Class Probabilities**: The highest model confidence score is shown alongside the full class probability breakdown."
+        )
+        st.caption("Displayed values represent model confidence scores on 32×32 inputs.")
+
+    # Cache model resource in memory across Streamlit reruns
+    @st.cache_resource(show_spinner="Loading pre-trained CNN model…")
+    def _get_cached_model():
+        return load_cifar10_model()
+
+    model, source_type, metrics = _get_cached_model()
+    if source_type == "trained" and metrics:
+        st.success(
+            f"Model ready. Trained for {metrics['epochs_completed']} epoch(s); "
+            f"held-out accuracy was {metrics['test_accuracy']:.1%}."
+        )
+    elif source_type == "bundle":
+        st.caption("✅ Pre-trained model loaded from the project repository.")
+    else:
+        st.caption("⚡ Model loaded from the local runtime cache.")
+
+    # Sample images option for zero-friction testing
+    sample_dir = Path(__file__).resolve().parent / "sample_images"
+    sample_files = sorted(sample_dir.glob("*.png")) if sample_dir.is_dir() else []
+
+    selected_image: Image.Image | None = None
+    image_source_label = ""
+
+    if sample_files:
+        sample_map = {f.stem.replace("_sample", "").title(): f for f in sample_files}
+        source_mode = st.radio(
+            "Select input method:",
+            ["Choose from sample images", "Upload your own image"],
+            horizontal=True,
+        )
+
+        if source_mode == "Choose from sample images":
+            sample_choice = st.selectbox(
+                "Pick a sample image to test:",
+                list(sample_map.keys()),
+            )
+            if sample_choice:
+                sample_path = sample_map[sample_choice]
+                try:
+                    with Image.open(sample_path) as src:
+                        selected_image = src.convert("RGB")
+                    image_source_label = f"Sample image: {sample_choice}"
+                except Exception as exc:
+                    st.error(f"Could not load sample image: {exc}")
+        else:
+            uploaded_file = st.file_uploader(
+                "Choose an image",
+                type=["png", "jpg", "jpeg", "webp"],
+                help="Upload a PNG, JPG, JPEG, or WebP image",
+            )
+            if uploaded_file is not None:
+                try:
+                    with Image.open(uploaded_file) as source_image:
+                        selected_image = source_image.convert("RGB")
+                    image_source_label = f"Uploaded: {uploaded_file.name}"
+                except (UnidentifiedImageError, OSError, ValueError):
+                    st.error("That file could not be read as an image. Upload a valid PNG, JPG, JPEG, or WebP file.")
+                    return
+    else:
+        uploaded_file = st.file_uploader(
+            "Choose an image",
+            type=["png", "jpg", "jpeg", "webp"],
+            help="Upload a PNG, JPG, JPEG, or WebP image",
+        )
+        if uploaded_file is not None:
+            try:
+                with Image.open(uploaded_file) as source_image:
+                    selected_image = source_image.convert("RGB")
+                image_source_label = f"Uploaded: {uploaded_file.name}"
+            except (UnidentifiedImageError, OSError, ValueError):
+                st.error("That file could not be read as an image. Upload a valid PNG, JPG, JPEG, or WebP file.")
+                return
+
+    if selected_image is None:
+        st.info("👆 Upload an image or select a sample image above to see the CNN prediction.")
         return
 
     left, right = st.columns([1, 1])
     with left:
-        # Embed a small, re-encoded preview so the uploaded file is never written to disk.
-        preview = image.resize((256, 256), Image.Resampling.NEAREST)
+        preview = selected_image.resize((256, 256), Image.Resampling.NEAREST)
         preview_buffer = io.BytesIO()
         preview.save(preview_buffer, format="PNG")
         preview_data = base64.b64encode(preview_buffer.getvalue()).decode("ascii")
         st.markdown(
-            f'<img src="data:image/png;base64,{preview_data}" alt="Uploaded image" '
-            'style="width:100%;max-width:256px;border-radius:10px;image-rendering:pixelated;">',
+            f'<img src="data:image/png;base64,{preview_data}" alt="Image preview" '
+            'style="width:100%;max-width:256px;border-radius:10px;image-rendering:pixelated;box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1);">',
             unsafe_allow_html=True,
         )
-        st.caption("Uploaded image resized for the CNN")
-    model_input = np.asarray(image.resize(IMAGE_SIZE), dtype=np.uint8)[np.newaxis, ...]
+        st.caption(f"{image_source_label} (resized to 32×32 for CNN)")
+
+    model_input = np.asarray(selected_image.resize(IMAGE_SIZE), dtype=np.uint8)[np.newaxis, ...]
     scores = model.predict(model_input, verbose=0)[0]
     predicted_id = int(np.argmax(scores))
     confidence = float(scores[predicted_id])
+
     with right:
         st.subheader("Prediction")
-        st.metric("Most likely class", CLASS_NAMES[predicted_id], f"{confidence:.1%} model confidence")
-        st.progress(confidence)
-    st.subheader("Scores for all classes")
-    score_table = {name: float(scores[index]) for index, name in enumerate(CLASS_NAMES)}
+        st.metric(
+            label="Most Likely Class",
+            value=CLASS_NAMES[predicted_id].upper(),
+            delta=f"{confidence:.1%} confidence",
+        )
+        st.progress(min(max(confidence, 0.0), 1.0))
+
+    st.subheader("Confidence Scores across all 10 Classes")
+    score_table = {name.title(): float(scores[index]) for index, name in enumerate(CLASS_NAMES)}
     st.bar_chart(score_table, horizontal=True)
 
 
